@@ -1,36 +1,73 @@
-import numpy as np
-import random
-import pygame
+"""
+Snaketrier.py – Multi-Agent PPO Training with Per-Run Logging
+
+This version trains 9 agents with a shared PPO network until one snake fills the entire grid.
+It logs all training details (including per-update CSV logs and model checkpoints) in a new folder
+named based on the current timestamp. Logging output is also written to a file in that folder.
+"""
+
+import os
 import sys
 import time
-import threading
-import logging
 import math
+import random
+import queue
+import csv
+import logging
+import datetime
+import numpy as np
+import pygame
 from numba import njit
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
-import queue
-import csv
+import threading
 
-# Enable benchmark mode for cudnn if CUDA is available
-if torch.cuda.is_available():
+# ------------------------ PyOpenCL Initialization ------------------------ #
+try:
+    import pyopencl as cl
+    cl_ctx = cl.create_some_context()
+    cl_queue = cl.CommandQueue(cl_ctx)
+    logging.info("PyOpenCL context created.")
+except Exception as e:
+    cl_ctx = None
+    cl_queue = None
+    logging.info("PyOpenCL not available: " + str(e))
+
+# ------------------------ Device Setup ------------------------ #
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if device.type == "cuda":
     torch.backends.cudnn.benchmark = True
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.info(f"Using device: {device}")
+
+# ------------------------ Create Run Folder ------------------------ #
+timestamp = datetime.datetime.now().strftime("run_%Y%m%d_%H%M%S")
+run_folder = os.path.join(os.getcwd(), timestamp)
+os.makedirs(run_folder, exist_ok=True)
+
+# Also set up a file handler for logging into the run folder
+log_file = os.path.join(run_folder, "run.log")
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+fh = logging.FileHandler(log_file)
+fh.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+fh.setFormatter(formatter)
+logger.addHandler(fh)
 
 # ------------------------ State Computation ------------------------ #
 @njit
 def compute_state(snake, food_x, food_y, grid_w, grid_h, dir_index):
     head_x, head_y = snake[0]
     state = np.zeros(16, dtype=np.float32)
-    # Head & food positions (normalized)
+    # Normalize head and food positions
     state[0] = head_x / grid_w
     state[1] = head_y / grid_h
     state[2] = food_x / grid_w
     state[3] = food_y / grid_h
-    # Direction to food
+    # Relative food direction
     state[4] = (food_x - head_x) / grid_w
     state[5] = (food_y - head_y) / grid_h
     # Danger detection
@@ -40,7 +77,7 @@ def compute_state(snake, food_x, food_y, grid_w, grid_h, dir_index):
     state[9] = 1.0 if (head_x + 1 >= grid_w or (head_x + 1, head_y) in snake[1:]) else 0.0
     # Normalized snake length
     state[10] = len(snake) / (grid_w * grid_h)
-    # One-hot current direction
+    # One-hot encoding for current direction
     if dir_index == 0:
         state[11:15] = np.array([1, 0, 0, 0], dtype=np.float32)
     elif dir_index == 1:
@@ -49,9 +86,35 @@ def compute_state(snake, food_x, food_y, grid_w, grid_h, dir_index):
         state[11:15] = np.array([0, 0, 1, 0], dtype=np.float32)
     elif dir_index == 3:
         state[11:15] = np.array([0, 0, 0, 1], dtype=np.float32)
-    # Food direction binary flag
+    # Food direction flag
     state[15] = 1.0 if len(snake) > 1 else 0.0
     return state
+
+# ------------------------ PPO Network ------------------------ #
+class PPOAgent(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=128):
+        super(PPOAgent, self).__init__()
+        self.shared = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+        self.actor = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim),
+            nn.Softmax(dim=-1)
+        )
+        self.critic = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+    def forward(self, x):
+        x = self.shared(x)
+        return self.actor(x), self.critic(x)
 
 # ------------------------ Environment ------------------------ #
 class SnakeEnv:
@@ -63,7 +126,7 @@ class SnakeEnv:
         self.reset()
         
     def reset(self):
-        self.snake = [(self.grid_w//2, self.grid_h//2)]
+        self.snake = [(self.grid_w // 2, self.grid_h // 2)]
         self.direction = 3  # Start moving right
         self.spawn_food()
         self.done = False
@@ -173,7 +236,7 @@ class SnakeEnv:
                            (offset_x + self.food[0]*cell_size + cell_size//4, offset_y + self.food[1]*cell_size + cell_size//4),
                            cell_size//8)
 
-# ------------------------ PPO Network ------------------------ #
+# ------------------------ PPO Network for Training ------------------------ #
 class PPOAgent(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=128):
         super(PPOAgent, self).__init__()
@@ -210,7 +273,7 @@ class RolloutBuffer:
     def clear(self):
         self.__init__()
 
-# ------------------------ Hyperparameters & Device ------------------------ #
+# ------------------------ Hyperparameters ------------------------ #
 state_dim = 16
 action_dim = 4
 lr = 2.5e-4
@@ -222,7 +285,6 @@ batch_size = 128
 rollout_steps = 1024
 entropy_coef = 0.01
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 agent = PPOAgent(state_dim, action_dim).to(device)
 optimizer = optim.Adam(agent.parameters(), lr=lr)
 
@@ -236,7 +298,7 @@ agent_colors = [
 envs = [SnakeEnv(grid_w=20, grid_h=20, snake_color=agent_colors[i]) for i in range(NUM_AGENTS)]
 buffer = RolloutBuffer()
 vis_queue = queue.Queue()
-csv_queue = queue.Queue()  # Queue for CSV logging
+csv_queue = queue.Queue()  # For CSV logging
 
 # ------------------------ GAE & PPO Update ------------------------ #
 def compute_gae(rewards, values, dones, gamma, gae_lambda):
@@ -258,6 +320,9 @@ def ppo_update():
     actions = torch.tensor(buffer.actions, dtype=torch.int64).to(device)
     old_log_probs = torch.tensor(buffer.log_probs, dtype=torch.float32).to(device)
     values = torch.tensor(buffer.values, dtype=torch.float32).to(device).squeeze()
+    
+    if device.type == "cpu" and cl_ctx is not None:
+        logging.info("Using PyOpenCL acceleration for PPO update (placeholder).")
     
     returns, advantages = compute_gae(buffer.rewards, buffer.values, buffer.dones, gamma, gae_lambda)
     returns = torch.tensor(returns, dtype=torch.float32).to(device)
@@ -306,6 +371,7 @@ def train_thread():
     num_updates = 2000
     training_done = False
     best_reward = -float('inf')
+    best_steps = float('inf')  # fewer moves is better
     episode_rewards = [0 for _ in range(NUM_AGENTS)]
     episode_lengths = [0 for _ in range(NUM_AGENTS)]
     episode_count = 0
@@ -351,10 +417,13 @@ def train_thread():
                     except queue.Full:
                         pass
                 
+                # End episode if done or if snake fills grid
                 if done or (len(env.snake) >= env.grid_w * env.grid_h):
                     episode_count += 1
-                    if episode_rewards[i] > best_reward:
+                    # Update best performance: higher score, tie-breaker by fewer moves
+                    if (episode_rewards[i] > best_reward) or (episode_rewards[i] == best_reward and episode_lengths[i] < best_steps):
                         best_reward = episode_rewards[i]
+                        best_steps = episode_lengths[i]
                     if episode_count % 10 == 0:
                         logging.info(f"Episode {episode_count} (Agent {i}) - Reward: {episode_rewards[i]:.2f}, Length: {episode_lengths[i]}")
                     states[i] = env.reset()
@@ -368,10 +437,9 @@ def train_thread():
         
         ppo_update()
         update_duration = time.time() - update_start_time
-        # Compute average reward for this update (if any nonzero)
         valid_rewards = [r for r in episode_rewards if r != 0]
         avg_reward = sum(valid_rewards)/len(valid_rewards) if valid_rewards else 0
-        log_msg = f"Update {update+1} - Avg Reward: {avg_reward:.2f}, Duration: {update_duration:.2f}s, Best Reward: {best_reward:.2f}"
+        log_msg = f"Update {update+1} - Avg Reward: {avg_reward:.2f}, Duration: {update_duration:.2f}s, Best Reward: {best_reward:.2f} (in {best_steps} moves)"
         logging.info(log_msg)
         try:
             vis_queue.put_nowait(("update", {
@@ -383,7 +451,6 @@ def train_thread():
         except queue.Full:
             pass
         
-        # Send CSV update details to CSV thread
         try:
             csv_queue.put_nowait({
                 "update": update,
@@ -396,23 +463,25 @@ def train_thread():
             pass
         
         if (update + 1) % 25 == 0:
+            ckpt_path = os.path.join(run_folder, f'snake_model_update_{update+1}.pt')
             torch.save({
                 'model_state_dict': agent.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'update': update,
                 'best_reward': best_reward
-            }, f'snake_model_update_{update+1}.pt')
+            }, ckpt_path)
             
         if training_done:
             break
     
     training_done = True
-    logging.info("Training finished. Best reward: %.2f", best_reward)
+    final_model_path = os.path.join(run_folder, 'snake_model_final.pt')
+    logging.info("Training finished. Best reward: %.2f (in %d moves)", best_reward, best_steps)
     torch.save({
         'model_state_dict': agent.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'best_reward': best_reward
-    }, 'snake_model_final.pt')
+    }, final_model_path)
     vis_queue.put(("done", None))
     csv_queue.put("done")
 
@@ -542,8 +611,8 @@ def visualize_thread():
 
 # ------------------------ CSV Logging Thread ------------------------ #
 def csv_thread():
-    # Open CSV file and write header
-    with open("training_details.csv", mode="w", newline="") as csvfile:
+    csv_path = os.path.join(run_folder, "training_details.csv")
+    with open(csv_path, mode="w", newline="") as csvfile:
         fieldnames = ["update", "avg_reward", "best_reward", "update_duration", "episode_count"]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
