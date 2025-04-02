@@ -4,6 +4,9 @@ Snaketrier.py – Multi-Agent PPO Training with Per-Run Logging
 This version trains 9 agents with a shared PPO network until one snake fills the entire grid.
 It logs all training details (including per-update CSV logs and model checkpoints) in a new folder
 named based on the current timestamp. Logging output is also written to a file in that folder.
+
+System configuration (e.g. device selection) is obtained via interactive prompts in the terminal.
+Display settings (FPS, simulation speed relative to training) can be adjusted at runtime via the game window.
 """
 
 import os
@@ -24,30 +27,68 @@ import torch.optim as optim
 from torch.distributions import Categorical
 import threading
 
+# ------------------------ Fixed Hyperparameters & Defaults ------------------------ #
+batch_size = 128
+rollout_steps = 1024
+# Initial display settings (can be changed in the game window)
+display_speed = 1.0   # Multiplier for simulation steps per frame
+display_fps = 60      # Initial FPS cap for the display
+
 # ------------------------ PyOpenCL Initialization ------------------------ #
 try:
     import pyopencl as cl
-    cl_ctx = cl.create_some_context()
-    cl_queue = cl.CommandQueue(cl_ctx)
-    logging.info("PyOpenCL context created.")
+    platforms = cl.get_platforms()
+    devices = []
+    for p in platforms:
+        devices.extend(p.get_devices())
+    if devices:
+        print("Available OpenCL devices:")
+        for i, d in enumerate(devices):
+            print(f"{i}: {d.name}")
+        try:
+            selected = int(input("Select OpenCL device index (default 0): ") or "0")
+        except Exception:
+            selected = 0
+        cl_ctx = cl.Context(devices=[devices[selected]])
+        cl_queue = cl.CommandQueue(cl_ctx)
+        logging.info(f"PyOpenCL context created using device: {devices[selected].name}")
+    else:
+        cl_ctx = None
+        cl_queue = None
+        logging.info("No OpenCL devices found.")
 except Exception as e:
     cl_ctx = None
     cl_queue = None
     logging.info("PyOpenCL not available: " + str(e))
 
-# ------------------------ Device Setup ------------------------ #
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-if device.type == "cuda":
+# ------------------------ Torch Device Setup (CUDA) ------------------------ #
+if torch.cuda.is_available():
+    if torch.cuda.device_count() > 1:
+        print("Multiple CUDA devices available:")
+        for i in range(torch.cuda.device_count()):
+            print(f"{i}: {torch.cuda.get_device_name(i)}")
+        try:
+            cuda_index = int(input("Select CUDA device index (default 0): ") or "0")
+        except Exception:
+            cuda_index = 0
+        device = torch.device(f"cuda:{cuda_index}")
+    else:
+        device = torch.device("cuda")
     torch.backends.cudnn.benchmark = True
+else:
+    device = torch.device("cpu")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logging.info(f"Using device: {device}")
 
-# ------------------------ Create Run Folder ------------------------ #
+# Use all available CPU threads
+torch.set_num_threads(os.cpu_count())
+logging.info(f"Using {os.cpu_count()} CPU threads.")
+
+# ------------------------ Create Run Folder & Logger ------------------------ #
 timestamp = datetime.datetime.now().strftime("run_%Y%m%d_%H%M%S")
 run_folder = os.path.join(os.getcwd(), timestamp)
 os.makedirs(run_folder, exist_ok=True)
 
-# Also set up a file handler for logging into the run folder
 log_file = os.path.join(run_folder, "run.log")
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -57,7 +98,7 @@ formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 fh.setFormatter(formatter)
 logger.addHandler(fh)
 
-# ------------------------ State Computation ------------------------ #
+# ------------------------ Numba Accelerated State Computation ------------------------ #
 @njit
 def compute_state(snake, food_x, food_y, grid_w, grid_h, dir_index):
     head_x, head_y = snake[0]
@@ -90,7 +131,7 @@ def compute_state(snake, food_x, food_y, grid_w, grid_h, dir_index):
     state[15] = 1.0 if len(snake) > 1 else 0.0
     return state
 
-# ------------------------ PPO Network ------------------------ #
+# ------------------------ PPO Network Definition ------------------------ #
 class PPOAgent(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=128):
         super(PPOAgent, self).__init__()
@@ -116,7 +157,7 @@ class PPOAgent(nn.Module):
         x = self.shared(x)
         return self.actor(x), self.critic(x)
 
-# ------------------------ Environment ------------------------ #
+# ------------------------ Snake Environment ------------------------ #
 class SnakeEnv:
     def __init__(self, grid_w=20, grid_h=20, cell=20, snake_color=(0,255,0)):
         self.grid_w = grid_w
@@ -170,7 +211,6 @@ class SnakeEnv:
             return self.get_state(), reward, self.done, {}
             
         self.snake.insert(0, new_head)
-        reward = 0.0
         self.steps_without_food += 1
         
         if new_head == self.food:
@@ -236,32 +276,7 @@ class SnakeEnv:
                            (offset_x + self.food[0]*cell_size + cell_size//4, offset_y + self.food[1]*cell_size + cell_size//4),
                            cell_size//8)
 
-# ------------------------ PPO Network for Training ------------------------ #
-class PPOAgent(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=128):
-        super(PPOAgent, self).__init__()
-        self.shared = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU()
-        )
-        self.actor = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim),
-            nn.Softmax(dim=-1)
-        )
-        self.critic = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
-        )
-        
-    def forward(self, x):
-        x = self.shared(x)
-        return self.actor(x), self.critic(x)
-
+# ------------------------ PPO Training Components ------------------------ #
 class RolloutBuffer:
     def __init__(self):
         self.states = []
@@ -273,7 +288,7 @@ class RolloutBuffer:
     def clear(self):
         self.__init__()
 
-# ------------------------ Hyperparameters ------------------------ #
+# Hyperparameters for PPO
 state_dim = 16
 action_dim = 4
 lr = 2.5e-4
@@ -281,8 +296,6 @@ gamma = 0.99
 gae_lambda = 0.95
 clip_epsilon = 0.2
 ppo_epochs = 10
-batch_size = 128
-rollout_steps = 1024
 entropy_coef = 0.01
 
 agent = PPOAgent(state_dim, action_dim).to(device)
@@ -300,6 +313,9 @@ buffer = RolloutBuffer()
 vis_queue = queue.Queue()
 csv_queue = queue.Queue()  # For CSV logging
 
+# ------------------------ Automatic Mixed Precision (AMP) ------------------------ #
+scaler = torch.cuda.amp.GradScaler() if device.type == "cuda" else None
+
 # ------------------------ GAE & PPO Update ------------------------ #
 def compute_gae(rewards, values, dones, gamma, gae_lambda):
     next_value = 0
@@ -309,7 +325,7 @@ def compute_gae(rewards, values, dones, gamma, gae_lambda):
         if step == len(rewards) - 1 or dones[step]:
             next_value = 0
         delta = rewards[step] + gamma * next_value * (1 - dones[step]) - values[step]
-        advantage = delta + gamma * gae_lambda * (1 - dones[step]) * (next_value if step == len(rewards) - 1 else advantages[0])
+        advantage = delta + gamma * gae_lambda * (1 - dones[step]) * (advantages[0] if advantages else 0)
         advantages.insert(0, advantage)
         returns.insert(0, advantage + values[step])
         next_value = values[step]
@@ -320,9 +336,6 @@ def ppo_update():
     actions = torch.tensor(buffer.actions, dtype=torch.int64).to(device)
     old_log_probs = torch.tensor(buffer.log_probs, dtype=torch.float32).to(device)
     values = torch.tensor(buffer.values, dtype=torch.float32).to(device).squeeze()
-    
-    if device.type == "cpu" and cl_ctx is not None:
-        logging.info("Using PyOpenCL acceleration for PPO update (placeholder).")
     
     returns, advantages = compute_gae(buffer.rewards, buffer.values, buffer.dones, gamma, gae_lambda)
     returns = torch.tensor(returns, dtype=torch.float32).to(device)
@@ -342,23 +355,45 @@ def ppo_update():
             b_returns = returns[indices]
             b_advantages = advantages[indices]
             
-            probs, value = agent(b_states)
-            dist = Categorical(probs)
-            new_log_probs = dist.log_prob(b_actions)
-            entropy = dist.entropy().mean()
-            
-            ratio = torch.exp(new_log_probs - b_old_log_probs)
-            surr1 = ratio * b_advantages
-            surr2 = torch.clamp(ratio, 1 - clip_epsilon, 1 + clip_epsilon) * b_advantages
-            policy_loss = -torch.min(surr1, surr2).mean()
-            
-            value_loss = nn.MSELoss()(value.squeeze(), b_returns)
-            loss = policy_loss + 0.5 * value_loss - entropy_coef * entropy
+            if scaler:
+                with torch.cuda.amp.autocast():
+                    probs, value = agent(b_states)
+                    dist = Categorical(probs)
+                    new_log_probs = dist.log_prob(b_actions)
+                    entropy = dist.entropy().mean()
+                    
+                    ratio = torch.exp(new_log_probs - b_old_log_probs)
+                    surr1 = ratio * b_advantages
+                    surr2 = torch.clamp(ratio, 1 - clip_epsilon, 1 + clip_epsilon) * b_advantages
+                    policy_loss = -torch.min(surr1, surr2).mean()
+                    
+                    value_loss = nn.MSELoss()(value.squeeze(), b_returns)
+                    loss = policy_loss + 0.5 * value_loss - entropy_coef * entropy
+            else:
+                probs, value = agent(b_states)
+                dist = Categorical(probs)
+                new_log_probs = dist.log_prob(b_actions)
+                entropy = dist.entropy().mean()
+                
+                ratio = torch.exp(new_log_probs - b_old_log_probs)
+                surr1 = ratio * b_advantages
+                surr2 = torch.clamp(ratio, 1 - clip_epsilon, 1 + clip_epsilon) * b_advantages
+                policy_loss = -torch.min(surr1, surr2).mean()
+                
+                value_loss = nn.MSELoss()(value.squeeze(), b_returns)
+                loss = policy_loss + 0.5 * value_loss - entropy_coef * entropy
             
             optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
-            optimizer.step()
+            if scaler:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
+                optimizer.step()
             total_loss += loss.item()
     
     avg_loss = total_loss / (ppo_epochs * dataset_size / batch_size)
@@ -417,10 +452,8 @@ def train_thread():
                     except queue.Full:
                         pass
                 
-                # End episode if done or if snake fills grid
                 if done or (len(env.snake) >= env.grid_w * env.grid_h):
                     episode_count += 1
-                    # Update best performance: higher score, tie-breaker by fewer moves
                     if (episode_rewards[i] > best_reward) or (episode_rewards[i] == best_reward and episode_lengths[i] < best_steps):
                         best_reward = episode_rewards[i]
                         best_steps = episode_lengths[i]
@@ -491,13 +524,14 @@ def visualize_thread():
     info_obj = pygame.display.Info()
     screen_width = info_obj.current_w
     screen_height = info_obj.current_h
-    sidebar_width = 200  # Fixed sidebar width
+    sidebar_width = 200  # Fixed sidebar width for info display
     available_width = screen_width - sidebar_width
     cols = math.ceil(math.sqrt(NUM_AGENTS))
     rows = math.ceil(NUM_AGENTS / cols)
     viewport_width = available_width // cols
     viewport_height = screen_height // rows
-    
+
+    # Create fullscreen window (vsync behavior is system/driver dependent)
     screen = pygame.display.set_mode((screen_width, screen_height), pygame.FULLSCREEN)
     pygame.display.set_caption("Multi-Agent Snake PPO")
     clock = pygame.time.Clock()
@@ -513,23 +547,33 @@ def visualize_thread():
     last_actions = ["None" for _ in range(NUM_AGENTS)]
     demo_envs = envs.copy()
     
+    # Set default FPS preset index to 2 (corresponding to 60 FPS)
+    preset_index = 2
+    fps_presets = [30, 45, 60, 75, 90]
+    
     running = True
     paused = False
-    fps = 15
-    visualize_every = 2
-    frame_count = 0
     
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN:
+                # SPACE toggles pause/resume
                 if event.key == pygame.K_SPACE:
                     paused = not paused
+                # UP/DOWN adjust simulation speed multiplier
                 elif event.key == pygame.K_UP:
-                    fps = min(60, fps + 5)
+                    global display_speed
+                    display_speed = min(5.0, display_speed + 0.1)
                 elif event.key == pygame.K_DOWN:
-                    fps = max(5, fps - 5)
+                    display_speed = max(0.1, display_speed - 0.1)
+                # 'f' key cycles through preset FPS caps
+                elif event.key == pygame.K_f:
+                    preset_index = (preset_index + 1) % len(fps_presets)
+                    global display_fps
+                    display_fps = fps_presets[preset_index]
+                    logging.info(f"Display FPS set to {display_fps}")
                     
         try:
             msg_type, data = vis_queue.get_nowait()
@@ -547,11 +591,6 @@ def visualize_thread():
         except queue.Empty:
             pass
         
-        frame_count += 1
-        if frame_count % visualize_every != 0 and not paused:
-            clock.tick(fps * visualize_every)
-            continue
-        
         screen.fill((30, 30, 40))
         for i, env in enumerate(demo_envs):
             col = i % cols
@@ -562,7 +601,7 @@ def visualize_thread():
             env.render(screen, offset_x=offset_x, offset_y=offset_y, cell_size=cell_size)
             overlay_rect = pygame.Rect(offset_x, offset_y, viewport_width, 30)
             pygame.draw.rect(screen, (40,40,50), overlay_rect)
-            info_text = font.render(f"Agent {i} | Score: {len(env.snake)} | Last Action: {last_actions[i]}", True, (220,220,220))
+            info_text = font.render(f"Agent {i} | Score: {len(env.snake)} | Last: {last_actions[i]}", True, (220,220,220))
             screen.blit(info_text, (offset_x + 10, offset_y + 5))
         
         sidebar_rect = pygame.Rect(screen_width - sidebar_width, 0, sidebar_width, screen_height)
@@ -575,7 +614,8 @@ def visualize_thread():
             f"Episodes: {episode_count}",
             f"Avg Reward: {avg_reward:.2f}",
             f"Best Reward: {best_reward:.2f}",
-            f"FPS: {fps}"
+            f"Speed: {display_speed:.1f}x",
+            f"FPS: {display_fps}"
         ]
         for text in texts:
             text_surface = font.render(text, True, (220, 220, 220))
@@ -585,27 +625,30 @@ def visualize_thread():
         controls = [
             "Controls:",
             "SPACE - Pause/Resume",
-            "UP - Increase speed",
-            "DOWN - Decrease speed"
+            "UP/DOWN - Adjust simulation speed",
+            "'f' - Cycle FPS cap"
         ]
         for text in controls:
             text_surface = small_font.render(text, True, (180, 180, 180))
             screen.blit(text_surface, (screen_width - sidebar_width + 10, y_pos))
             y_pos += 20
+        
         pygame.display.flip()
         
         if not paused:
-            for i, env in enumerate(demo_envs):
-                if not env.done:
-                    state_tensor = torch.tensor(env.get_state(), dtype=torch.float32).to(device)
-                    with torch.no_grad():
-                        probs, _ = agent(state_tensor)
-                    action = Categorical(probs).sample().item()
-                    last_actions[i] = {0:"UP",1:"DOWN",2:"LEFT",3:"RIGHT"}[action]
-                    state, _, done, _ = env.step(action)
-                    if done:
-                        env.reset()
-            clock.tick(fps)
+            steps_to_simulate = int(round(display_speed))
+            for _ in range(steps_to_simulate):
+                for i, env in enumerate(demo_envs):
+                    if not env.done:
+                        state_tensor = torch.tensor(env.get_state(), dtype=torch.float32).to(device)
+                        with torch.no_grad():
+                            probs, _ = agent(state_tensor)
+                        action = Categorical(probs).sample().item()
+                        last_actions[i] = {0:"UP",1:"DOWN",2:"LEFT",3:"RIGHT"}[action]
+                        state, _, done, _ = env.step(action)
+                        if done:
+                            env.reset()
+        clock.tick(display_fps)
     
     pygame.quit()
 
