@@ -1,12 +1,6 @@
 """
 Snaketrier.py – Multi-Agent PPO Training with Per-Run Logging
-
-This version trains 9 agents with a shared PPO network until one snake fills the entire grid.
-It logs all training details (including per-update CSV logs and model checkpoints) in a new folder
-named based on the current timestamp. Logging output is also written to a file in that folder.
-
-System configuration (e.g. device selection) is obtained via interactive prompts in the terminal.
-Display settings (FPS, simulation speed relative to training) can be adjusted at runtime via the game window.
+Enhanced to Address Reward Plateaus while Preserving (or Improving) Learning
 """
 
 import os
@@ -24,8 +18,10 @@ from numba import njit
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.distributions import Categorical
 import threading
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # ------------------------ Fixed Hyperparameters & Defaults ------------------------ #
 batch_size = 128
@@ -33,6 +29,18 @@ rollout_steps = 1024
 # Initial display settings (can be changed in the game window)
 display_speed = 1.0   # Multiplier for simulation steps per frame
 display_fps = 60      # Initial FPS cap for the display
+
+# ------------------------ Adaptive and Dynamic Hyperparameters ------------------------ #
+# Adaptive entropy coefficient parameters
+initial_entropy_coef = 0.05
+min_entropy_coef = 0.001
+entropy_decay = 0.9999  # Decay per update
+entropy_coef = initial_entropy_coef  # global variable to be updated
+
+# Dynamic clip epsilon parameters for PPO
+initial_clip_epsilon = 0.2
+min_clip_epsilon = 0.05
+clip_epsilon = initial_clip_epsilon  # global variable to be updated
 
 # ------------------------ PyOpenCL Initialization ------------------------ #
 try:
@@ -172,6 +180,7 @@ class SnakeEnv:
         self.spawn_food()
         self.done = False
         self.steps_without_food = 0
+        # Initial value; will be adjusted via curriculum learning
         self.max_steps_without_food = 2 * (self.grid_w + self.grid_h)
         return self.get_state()
         
@@ -182,6 +191,7 @@ class SnakeEnv:
                 break
                 
     def step(self, action):
+        # Update direction if not opposite
         if action == 0 and self.direction != 1:
             self.direction = 0
         elif action == 1 and self.direction != 0:
@@ -203,6 +213,7 @@ class SnakeEnv:
         head = self.snake[0]
         new_head = (head[0] + delta[0], head[1] + delta[1])
         
+        # Check collision with walls or self
         if (new_head[0] < 0 or new_head[0] >= self.grid_w or 
             new_head[1] < 0 or new_head[1] >= self.grid_h or 
             new_head in self.snake):
@@ -213,6 +224,7 @@ class SnakeEnv:
         self.snake.insert(0, new_head)
         self.steps_without_food += 1
         
+        # Compute base reward and update food if eaten
         if new_head == self.food:
             reward = 10.0 + len(self.snake) * 0.1
             self.spawn_food()
@@ -222,7 +234,25 @@ class SnakeEnv:
             prev_dist = abs(head[0] - self.food[0]) + abs(head[1] - self.food[1])
             curr_dist = abs(new_head[0] - self.food[0]) + abs(new_head[1] - self.food[1])
             reward = 0.1 if curr_dist < prev_dist else -0.1
-                
+        
+        # Enhanced reward: reward efficient path planning if snake is long enough
+        if len(self.snake) > 10:
+            min_x = min(p[0] for p in self.snake)
+            max_x = max(p[0] for p in self.snake)
+            min_y = min(p[1] for p in self.snake)
+            max_y = max(p[1] for p in self.snake)
+            area = (max_x - min_x + 1) * (max_y - min_y + 1)
+            efficiency = len(self.snake) / max(area, 1)
+            reward += efficiency * 0.5
+        
+        # Enhanced reward: bonus for navigating tight spaces
+        head = self.snake[0]
+        adjacent_occupied = sum(1 for dx, dy in [(0,1), (1,0), (0,-1), (-1,0)]
+                                if (head[0]+dx, head[1]+dy) in self.snake[1:])
+        if adjacent_occupied >= 2 and not self.done:
+            reward += 0.2
+            
+        # Check for too many steps without food (environment termination)
         if self.steps_without_food >= self.max_steps_without_food:
             self.done = True
             reward = -5.0
@@ -294,12 +324,12 @@ action_dim = 4
 lr = 2.5e-4
 gamma = 0.99
 gae_lambda = 0.95
-clip_epsilon = 0.2
 ppo_epochs = 10
-entropy_coef = 0.01
+# (entropy_coef and clip_epsilon are now dynamic)
 
 agent = PPOAgent(state_dim, action_dim).to(device)
 optimizer = optim.Adam(agent.parameters(), lr=lr)
+scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=50)
 
 # ------------------------ Multi-Agent Setup ------------------------ #
 NUM_AGENTS = 9
@@ -400,9 +430,18 @@ def ppo_update():
     logging.info(f"PPO Loss: {avg_loss:.4f}")
     buffer.clear()
 
+# ------------------------ Curriculum Learning Function ------------------------ #
+def adjust_environment_difficulty(env, update):
+    if update < 1000:
+        env.max_steps_without_food = 100  # More forgiving early on
+    elif update < 5000:
+        env.max_steps_without_food = 60
+    else:
+        env.max_steps_without_food = 40  # More challenging later
+
 # ------------------------ Training Thread ------------------------ #
 def train_thread():
-    global training_done
+    global training_done, entropy_coef, clip_epsilon
     num_updates = 2000
     training_done = False
     best_reward = -float('inf')
@@ -414,6 +453,19 @@ def train_thread():
     
     for update in range(num_updates):
         update_start_time = time.time()
+        
+        # Update adaptive entropy coefficient based on current update
+        entropy_coef = max(initial_entropy_coef * (entropy_decay ** update), min_entropy_coef)
+        
+        # Optionally update clip epsilon every 100 updates
+        if update % 100 == 0 and update > 0:
+            clip_epsilon = max(clip_epsilon * 0.95, min_clip_epsilon)
+            logging.info(f"Updated clip_epsilon: {clip_epsilon:.4f}")
+        
+        # Adjust environment difficulty for curriculum learning
+        for env in envs:
+            adjust_environment_difficulty(env, update)
+        
         for step in range(rollout_steps):
             for i, env in enumerate(envs):
                 state = states[i]
@@ -494,6 +546,9 @@ def train_thread():
             })
         except queue.Full:
             pass
+        
+        # Update learning rate scheduler with the current mean reward
+        scheduler.step(avg_reward)
         
         if (update + 1) % 25 == 0:
             ckpt_path = os.path.join(run_folder, f'snake_model_update_{update+1}.pt')
